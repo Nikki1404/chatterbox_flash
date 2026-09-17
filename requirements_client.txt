@@ -1,0 +1,5 @@
+numpy
+websockets
+sounddevice
+soundfile
+openai
