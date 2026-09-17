@@ -117,3 +117,17 @@ print('FlashInfer:', flashinfer.__version__)
 docker: Error response from daemon: failed to discover GPU vendor from CDI: no known GPU vendor found
 
 Run 'docker run --help' for more information
+
+(base) root@EC03-E01-AICO3:/home/CORP/re_nikitav/chatterbox_flash# nvidia-ctk --version
+nvidia-ctk: command not found
+(base) root@EC03-E01-AICO3:/home/CORP/re_nikitav/chatterbox_flash# cd ..
+(base) root@EC03-E01-AICO3:/home/CORP/re_nikitav# nvidia-ctk --version
+nvidia-ctk: command not found
+(base) root@EC03-E01-AICO3:/home/CORP/re_nikitav# docker info | grep -i -E "runtime|nvidia|cdi"
+ CDI spec directories:
+  /etc/cdi
+  /var/run/cdi
+ Runtimes: io.containerd.runc.v2 runc
+ Default Runtime: runc
+(base) root@EC03-E01-AICO3:/home/CORP/re_nikitav# ls -la /etc/cdi /var/run/cdi 2>/dev/null
+(base) root@EC03-E01-AICO3:/home/CORP/re_nikitav#
