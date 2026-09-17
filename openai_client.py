@@ -6,7 +6,7 @@ client = OpenAI(
 )
 
 with client.audio.speech.with_streaming_response.create(
-    model="chatterbox-flash",
+    model="tts-1",
     voice="reference",
     input="Hello, thank you for calling. How may I help you today?",
     response_format="wav",
