@@ -130,4 +130,10 @@ docker run --rm \
   python -c "import torch; import flashinfer; print('GPU:', torch.cuda.get_device_name(0)); print('CUDA available:', torch.cuda.is_available()); print('Torch CUDA:', torch.version.cuda); print('FlashInfer:', flashinfer.__version__)"
 
 
-
+docker run --rm -it \
+  --gpus all \
+  --ipc=host \
+  --shm-size=8g \
+  -p 8000:8000 \
+  -v "$(pwd)/reference.wav:/app/reference.wav:ro" \
+  chatterbox-flash
