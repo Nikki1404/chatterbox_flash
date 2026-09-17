@@ -13,7 +13,13 @@ from typing import Literal
 
 import numpy as np
 import torch
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
+
+from fastapi import (
+    FastAPI,
+    HTTPException,
+    WebSocket,
+    WebSocketDisconnect,
+)
 from fastapi.responses import Response
 from pydantic import BaseModel
 
@@ -84,59 +90,38 @@ N_CFM_TIMESTEPS = int(
     os.getenv("N_CFM_TIMESTEPS", "2")
 )
 
-
-# Maximum text size for one T3 generation.
-#
-# Long text sent by the client is automatically split into
-# multiple TTS-safe utterances.
+# Keep individual generation requests reasonably short.
+# The client can still send an arbitrarily longer text file.
 MAX_CHUNK_CHARS = int(
-    os.getenv("MAX_CHUNK_CHARS", "280")
-)
-
-
-# Safety ceiling for generated speech tokens for one chunk.
-#
-# This is deliberately below very large model position limits.
-MAX_SPEECH_TOKENS = int(
-    os.getenv("MAX_SPEECH_TOKENS", "2048")
+    os.getenv("MAX_CHUNK_CHARS", "180")
 )
 
 
 # ============================================================
-# Application
+# FastAPI
 # ============================================================
 
 app = FastAPI(
     title="Chatterbox-Flash TTS",
-    version="1.1.0",
+    version="1.2.0",
 )
 
 tts = None
 
-# One model / GPU.
-#
-# Prevent simultaneous inference requests from trying to use
-# the same model state/GPU buffers at the same time.
+# Only one inference operation should access this model/GPU
+# at a time.
 gpu_lock = threading.Lock()
 
 
 # ============================================================
-# OpenAI request schema
+# OpenAI request
 # ============================================================
 
 class OpenAISpeechRequest(BaseModel):
-
     model: str = "chatterbox-flash"
-
     input: str
-
     voice: str = "reference"
-
-    response_format: Literal[
-        "wav",
-        "pcm",
-    ] = "wav"
-
+    response_format: Literal["wav", "pcm"] = "wav"
     speed: float = 1.0
 
 
@@ -151,7 +136,6 @@ def ms():
 def to_pcm16(wav_tensor) -> bytes:
 
     if torch.is_tensor(wav_tensor):
-
         arr = (
             wav_tensor
             .detach()
@@ -159,16 +143,10 @@ def to_pcm16(wav_tensor) -> bytes:
             .cpu()
             .numpy()
         )
-
     else:
+        arr = np.asarray(wav_tensor)
 
-        arr = np.asarray(
-            wav_tensor
-        )
-
-    arr = np.asarray(
-        arr
-    ).squeeze()
+    arr = np.asarray(arr).squeeze()
 
     arr = np.nan_to_num(
         arr,
@@ -185,9 +163,7 @@ def to_pcm16(wav_tensor) -> bytes:
 
     return (
         arr * 32767.0
-    ).astype(
-        "<i2"
-    ).tobytes()
+    ).astype("<i2").tobytes()
 
 
 def pcm_to_wav(
@@ -197,28 +173,17 @@ def pcm_to_wav(
 
     buf = io.BytesIO()
 
-    with wave.open(
-        buf,
-        "wb",
-    ) as wf:
-
+    with wave.open(buf, "wb") as wf:
         wf.setnchannels(1)
-
         wf.setsampwidth(2)
-
-        wf.setframerate(
-            sample_rate
-        )
-
-        wf.writeframes(
-            pcm
-        )
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm)
 
     return buf.getvalue()
 
 
 # ============================================================
-# Text splitting
+# Long-text splitting
 # ============================================================
 
 def split_text_for_tts(
@@ -226,17 +191,17 @@ def split_text_for_tts(
     max_chars: int = MAX_CHUNK_CHARS,
 ):
     """
-    Split long text into safe TTS chunks.
+    Split long input into smaller TTS requests.
 
-    Priority:
+    Split priority:
 
-        sentence boundary
-              ↓
-        comma/semicolon
-              ↓
+        sentence
+           ↓
+        comma / semicolon / colon
+           ↓
         whitespace
 
-    No text is intentionally discarded.
+    The client can therefore send the complete text file.
     """
 
     text = re.sub(
@@ -248,17 +213,12 @@ def split_text_for_tts(
     if not text:
         return []
 
-    # --------------------------------------------------------
-    # Sentence split
-    # --------------------------------------------------------
-
     sentences = re.split(
         r"(?<=[.!?])\s+",
         text,
     )
 
     chunks = []
-
     current = ""
 
     for sentence in sentences:
@@ -269,51 +229,36 @@ def split_text_for_tts(
             continue
 
         # ----------------------------------------------------
-        # Normal sentence
+        # Sentence fits by itself
         # ----------------------------------------------------
 
         if len(sentence) <= max_chars:
 
-            if current:
-
-                candidate = (
-                    current
-                    + " "
-                    + sentence
-                )
-
-            else:
-
-                candidate = sentence
+            candidate = (
+                f"{current} {sentence}".strip()
+                if current
+                else sentence
+            )
 
             if len(candidate) <= max_chars:
-
                 current = candidate
 
             else:
-
                 if current:
-                    chunks.append(
-                        current
-                    )
+                    chunks.append(current)
 
                 current = sentence
 
             continue
 
         # ----------------------------------------------------
-        # Sentence itself is too long
+        # Long sentence
         # ----------------------------------------------------
 
         if current:
-
-            chunks.append(
-                current
-            )
-
+            chunks.append(current)
             current = ""
 
-        # Try punctuation boundaries.
         pieces = re.split(
             r"(?<=[,;:])\s+",
             sentence,
@@ -328,125 +273,94 @@ def split_text_for_tts(
             if not piece:
                 continue
 
-            if piece_buffer:
-
-                candidate = (
-                    piece_buffer
-                    + " "
-                    + piece
-                )
-
-            else:
-
-                candidate = piece
+            candidate = (
+                f"{piece_buffer} {piece}".strip()
+                if piece_buffer
+                else piece
+            )
 
             if len(candidate) <= max_chars:
-
                 piece_buffer = candidate
-
                 continue
 
             if piece_buffer:
-
-                chunks.append(
-                    piece_buffer
-                )
-
+                chunks.append(piece_buffer)
                 piece_buffer = ""
 
-            # ------------------------------------------------
-            # Piece is still too large.
-            # Split by words.
-            # ------------------------------------------------
+            # -----------------------------------------------
+            # Still too long -> split on words
+            # -----------------------------------------------
 
             if len(piece) > max_chars:
 
                 words = piece.split()
-
                 word_buffer = ""
 
                 for word in words:
 
-                    if word_buffer:
-
-                        candidate = (
-                            word_buffer
-                            + " "
-                            + word
-                        )
-
-                    else:
-
-                        candidate = word
+                    candidate = (
+                        f"{word_buffer} {word}".strip()
+                        if word_buffer
+                        else word
+                    )
 
                     if len(candidate) <= max_chars:
-
                         word_buffer = candidate
 
                     else:
-
                         if word_buffer:
-
-                            chunks.append(
-                                word_buffer
-                            )
+                            chunks.append(word_buffer)
 
                         word_buffer = word
 
                 if word_buffer:
-
-                    piece_buffer = (
-                        word_buffer
-                    )
+                    piece_buffer = word_buffer
 
             else:
-
                 piece_buffer = piece
 
         if piece_buffer:
-
-            current = (
-                piece_buffer
-            )
+            current = piece_buffer
 
     if current:
-
-        chunks.append(
-            current
-        )
+        chunks.append(current)
 
     return chunks
 
 
 # ============================================================
-# Standard full generation
+# Model generation
 # ============================================================
 
 def generate_full(text: str):
+    """
+    Use Chatterbox-Flash's high-level generation path.
+
+    Important:
+    We intentionally do NOT manually invoke tts.t3.generate()
+    here. The library handles its own token preparation,
+    generation length, FlashInfer execution and S3Gen.
+    """
 
     with gpu_lock, torch.inference_mode():
 
-        return tts.generate(
+        wav = tts.generate(
             text,
-
             num_steps=NUM_STEPS,
-
             temperature=TEMPERATURE,
-
             time_shift_tau=TIME_SHIFT_TAU,
-
             cfg_scale=CFG_SCALE,
-
             position_temperature=POSITION_TEMPERATURE,
-
             pmi_uncond_prior_precompute=True,
-
             use_cuda_graph=True,
-
             backend=BACKEND,
-
             n_cfm_timesteps=N_CFM_TIMESTEPS,
         )
+
+        if DEVICE == "cuda":
+            torch.cuda.synchronize()
+
+        return wav
 
 
 # ============================================================
@@ -459,14 +373,13 @@ async def startup():
     global tts
 
     # --------------------------------------------------------
-    # CUDA check
+    # CUDA validation
     # --------------------------------------------------------
 
     if (
         DEVICE == "cuda"
         and not torch.cuda.is_available()
     ):
-
         raise RuntimeError(
             "DEVICE=cuda but CUDA is unavailable."
         )
@@ -479,31 +392,30 @@ async def startup():
         )
 
         log.info(
+            "Torch version: %s",
+            torch.__version__,
+        )
+
+        log.info(
             "Torch CUDA: %s",
             torch.version.cuda,
         )
 
     # --------------------------------------------------------
-    # Load model
+    # Load Chatterbox
     # --------------------------------------------------------
 
     started = ms()
 
-    tts = (
-        ChatterboxFlashTTS
-        .from_pretrained(
-            MODEL_ID,
-
-            device=DEVICE,
-
-            dtype=(
-                torch.bfloat16
-                if DEVICE == "cuda"
-                else torch.float32
-            ),
-
-            drf_block_size=BLOCK_SIZE,
-        )
+    tts = ChatterboxFlashTTS.from_pretrained(
+        MODEL_ID,
+        device=DEVICE,
+        dtype=(
+            torch.bfloat16
+            if DEVICE == "cuda"
+            else torch.float32
+        ),
+        drf_block_size=BLOCK_SIZE,
     )
 
     log.info(
@@ -513,7 +425,7 @@ async def startup():
     )
 
     # --------------------------------------------------------
-    # Reference audio
+    # Reference voice
     # --------------------------------------------------------
 
     reference_path = Path(
@@ -522,17 +434,15 @@ async def startup():
 
     if not reference_path.exists():
 
-        log.warning(
-            "Reference audio missing: %s",
-            REFERENCE_AUDIO,
+        raise RuntimeError(
+            f"Reference audio missing: "
+            f"{REFERENCE_AUDIO}"
         )
-
-        return
 
     if not reference_path.is_file():
 
         raise RuntimeError(
-            f"REFERENCE_AUDIO is not a file: "
+            f"Reference audio is not a file: "
             f"{REFERENCE_AUDIO}"
         )
 
@@ -562,9 +472,6 @@ async def startup():
             "Hello."
         )
 
-        if DEVICE == "cuda":
-            torch.cuda.synchronize()
-
         log.info(
             "Warmup complete."
         )
@@ -585,7 +492,7 @@ async def root():
 
     return {
         "service": "chatterbox-flash",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "websocket": "/ws/tts",
         "openai_compatible": "/v1/audio/speech",
         "health": "/health",
@@ -620,9 +527,9 @@ async def health():
 
         "block_size": BLOCK_SIZE,
 
-        "max_chunk_chars": MAX_CHUNK_CHARS,
-
-        "max_speech_tokens": MAX_SPEECH_TOKENS,
+        "max_chunk_chars": (
+            MAX_CHUNK_CHARS
+        ),
 
         "reference_ready": bool(
             tts is not None
@@ -632,7 +539,7 @@ async def health():
 
 
 # ============================================================
-# OpenAI-compatible HTTP endpoint
+# OpenAI-compatible endpoint
 # ============================================================
 
 @app.post("/v1/audio/speech")
@@ -656,61 +563,79 @@ async def openai_audio_speech(
 
         raise HTTPException(
             status_code=503,
-            detail=(
-                "Reference voice is not prepared"
-            ),
+            detail="Reference voice is not prepared",
         )
 
     if req.speed != 1.0:
 
         raise HTTPException(
             status_code=400,
-            detail=(
-                "Only speed=1.0 is supported"
-            ),
+            detail="Only speed=1.0 is supported",
         )
 
     started = ms()
 
     try:
 
-        # ----------------------------------------------------
-        # Split long HTTP input as well.
-        # ----------------------------------------------------
-
-        chunks = split_text_for_tts(
+        # Long HTTP input is also split.
+        text_chunks = split_text_for_tts(
             text
         )
 
+        if not text_chunks:
+            raise ValueError(
+                "No text available for generation."
+            )
+
         log.info(
-            "HTTP TTS: %d chars -> %d chunk(s)",
+            "HTTP TTS | chars=%d | chunks=%d",
             len(text),
-            len(chunks),
+            len(text_chunks),
         )
 
         pcm_parts = []
 
         for index, chunk_text in enumerate(
-            chunks,
+            text_chunks,
             start=1,
         ):
 
             log.info(
-                "HTTP chunk %d/%d | chars=%d",
+                "HTTP generating chunk %d/%d | "
+                "chars=%d | text=%r",
                 index,
-                len(chunks),
+                len(text_chunks),
                 len(chunk_text),
-            )
-
-            wav_tensor = await asyncio.to_thread(
-                generate_full,
                 chunk_text,
             )
 
-            pcm_parts.append(
-                to_pcm16(
-                    wav_tensor
+            wav_tensor = (
+                await asyncio.to_thread(
+                    generate_full,
+                    chunk_text,
                 )
+            )
+
+            pcm = to_pcm16(
+                wav_tensor
+            )
+
+            if pcm:
+                pcm_parts.append(
+                    pcm
+                )
+
+            log.info(
+                "HTTP chunk %d/%d complete | "
+                "audio_bytes=%d",
+                index,
+                len(text_chunks),
+                len(pcm),
+            )
+
+        if not pcm_parts:
+            raise RuntimeError(
+                "No audio generated."
             )
 
         pcm = b"".join(
@@ -734,8 +659,9 @@ async def openai_audio_speech(
 
     log.info(
         "HTTP generation complete | "
-        "chunks=%d | %.2f ms",
-        len(chunks),
+        "chars=%d | chunks=%d | %.2f ms",
+        len(text),
+        len(text_chunks),
         elapsed,
     )
 
@@ -743,7 +669,7 @@ async def openai_audio_speech(
         "X-Model": "chatterbox-flash",
         "X-Generation-Ms": f"{elapsed:.2f}",
         "X-Text-Chunks": str(
-            len(chunks)
+            len(text_chunks)
         ),
         "Cache-Control": "no-store",
     }
@@ -752,11 +678,7 @@ async def openai_audio_speech(
 
         return Response(
             content=pcm,
-
-            media_type=(
-                "application/octet-stream"
-            ),
-
+            media_type="application/octet-stream",
             headers=headers,
         )
 
@@ -765,15 +687,13 @@ async def openai_audio_speech(
             pcm,
             tts.sr,
         ),
-
         media_type="audio/wav",
-
         headers=headers,
     )
 
 
 # ============================================================
-# WebSocket generation
+# WebSocket generation worker
 # ============================================================
 
 def streaming_generate(
@@ -781,59 +701,51 @@ def streaming_generate(
     out_q: queue.Queue,
 ):
     """
-    Long-text-safe WebSocket generation.
+    Reliable long-text WebSocket generation.
 
-    Client can send the entire text/file.
+    Full input:
+          ↓
+    sentence-aware splitting
+          ↓
+    tts.generate(chunk)
+          ↓
+    PCM16
+          ↓
+    WebSocket
 
-    Server:
-
-        full text
-           ↓
-        split text
-           ↓
-        T3 chunk
-           ↓
-        S3Gen
-           ↓
-        PCM
-           ↓
-        WebSocket
-
-    The same reference conditioning is reused for every
-    generated chunk.
+    Reference conditioning remains loaded in the same model
+    for every chunk.
     """
 
     started = ms()
 
     try:
 
-        # ----------------------------------------------------
-        # Split input
-        # ----------------------------------------------------
-
-        chunks = split_text_for_tts(
+        text_chunks = split_text_for_tts(
             text
         )
 
-        if not chunks:
+        if not text_chunks:
 
             raise ValueError(
                 "No text available for generation."
             )
 
         log.info(
-            "WebSocket TTS request: "
-            "%d chars -> %d chunk(s)",
+            "WebSocket TTS | "
+            "chars=%d | chunks=%d",
             len(text),
-            len(chunks),
+            len(text_chunks),
         )
 
+        successful_chunks = 0
+
         # ----------------------------------------------------
-        # Generate chunks sequentially
+        # Generate every text chunk
         # ----------------------------------------------------
 
         for index, chunk_text in enumerate(
-            chunks,
+            text_chunks,
             start=1,
         ):
 
@@ -843,243 +755,101 @@ def streaming_generate(
                 "Generating chunk %d/%d | "
                 "chars=%d | text=%r",
                 index,
-                len(chunks),
+                len(text_chunks),
                 len(chunk_text),
-                chunk_text[:120],
+                chunk_text,
             )
 
-            with gpu_lock, torch.inference_mode():
+            # IMPORTANT:
+            #
+            # Use Chatterbox's normal generation path.
+            #
+            # Do not manually call:
+            #
+            # tts._encode_text()
+            # tts.t3.generate()
+            # tts.s3gen.inference()
 
-                # --------------------------------------------
-                # Encode text
-                # --------------------------------------------
+            wav_tensor = generate_full(
+                chunk_text
+            )
 
-                text_tokens = (
-                    tts._encode_text(
-                        chunk_text,
-                        normalize_text=True,
-                    )
-                )
+            pcm = to_pcm16(
+                wav_tensor
+            )
 
-                n_tokens = int(
-                    text_tokens.size(1)
-                )
+            if not pcm:
 
-                # --------------------------------------------
-                # Speech token budget
-                # --------------------------------------------
-
-                estimated_speech_len = max(
-                    n_tokens * 6,
-                    300,
-                )
-
-                total_speech_len = min(
-                    estimated_speech_len,
-                    MAX_SPEECH_TOKENS,
-                )
-
-                log.info(
-                    "Chunk %d/%d | "
-                    "text_tokens=%d | "
-                    "speech_budget=%d",
+                log.warning(
+                    "Chunk %d/%d returned empty audio.",
                     index,
-                    len(chunks),
-                    n_tokens,
-                    total_speech_len,
+                    len(text_chunks),
                 )
 
-                # --------------------------------------------
-                # T3 generation
-                # --------------------------------------------
+                continue
 
-                speech_tokens = (
-                    tts.t3.generate(
-                        t3_cond=tts.conds.t3,
+            successful_chunks += 1
 
-                        text_tokens=text_tokens,
+            generation_ms = (
+                ms() - started
+            )
 
-                        text_token_lens=(
-                            torch.tensor(
-                                [n_tokens],
-                                device=tts.device,
-                                dtype=torch.long,
-                            )
-                        ),
-
-                        total_speech_len=(
-                            total_speech_len
-                        ),
-
-                        num_steps=NUM_STEPS,
-
-                        temperature=TEMPERATURE,
-
-                        time_shift_tau=TIME_SHIFT_TAU,
-
-                        omnivoice_schedule_t_shift=0.5,
-
-                        cfg_scale=CFG_SCALE,
-
-                        position_temperature=(
-                            POSITION_TEMPERATURE
-                        ),
-
-                        pmi_uncond_prior_precompute=True,
-
-                        use_cuda_graph=True,
-
-                        backend=BACKEND,
-
-                        batch_size=1,
-                    )
-                )
-
-                # --------------------------------------------
-                # Normalize speech token shape
-                # --------------------------------------------
-
-                if speech_tokens.ndim == 2:
-
-                    tokens = (
-                        speech_tokens[0]
-                    )
-
-                else:
-
-                    tokens = (
-                        speech_tokens
-                    )
-
-                # --------------------------------------------
-                # Remove stop token and anything after it
-                # --------------------------------------------
-
-                stop_token = (
-                    tts.t3.hp.stop_speech_token
-                )
-
-                eos = (
-                    tokens
-                    == stop_token
-                ).nonzero(
-                    as_tuple=True
-                )[0]
-
-                if len(eos):
-
-                    tokens = tokens[
-                        :eos[0].item()
-                    ]
-
-                if tokens.numel() == 0:
-
-                    log.warning(
-                        "Chunk %d/%d produced "
-                        "no speech tokens.",
-                        index,
-                        len(chunks),
-                    )
-
-                    continue
-
-                # --------------------------------------------
-                # S3Gen
-                # --------------------------------------------
-
-                wav_tensor, _ = (
-                    tts.s3gen.inference(
-                        speech_tokens=(
-                            tokens.to(
-                                tts.device
-                            )
-                        ),
-
-                        ref_dict=(
-                            tts.conds.gen
-                        ),
-
-                        n_cfm_timesteps=(
-                            N_CFM_TIMESTEPS
-                        ),
-                    )
-                )
-
-                if DEVICE == "cuda":
-                    torch.cuda.synchronize()
-
-                # --------------------------------------------
-                # Convert to PCM16
-                # --------------------------------------------
-
-                pcm = to_pcm16(
-                    wav_tensor
-                )
-
-            # ------------------------------------------------
-            # Send generated utterance
-            # ------------------------------------------------
-
-            if pcm:
-
-                out_q.put({
-                    "type": "audio",
-
-                    "pcm": pcm,
-
-                    "chunk": index,
-
-                    "total_chunks": len(
-                        chunks
-                    ),
-
-                    "generation_ms": (
-                        ms() - started
-                    ),
-                })
+            # Send completed chunk to websocket task.
+            out_q.put({
+                "type": "audio",
+                "pcm": pcm,
+                "chunk": index,
+                "total_chunks": len(
+                    text_chunks
+                ),
+                "generation_ms": (
+                    generation_ms
+                ),
+            })
 
             log.info(
                 "Chunk %d/%d complete | "
-                "text_chars=%d | "
-                "speech_tokens=%d | "
+                "chars=%d | "
                 "audio_bytes=%d | "
-                "%.2f ms",
+                "chunk_ms=%.2f",
                 index,
-                len(chunks),
+                len(text_chunks),
                 len(chunk_text),
-                int(tokens.numel()),
                 len(pcm),
                 ms() - chunk_started,
             )
 
         # ----------------------------------------------------
-        # Complete
+        # Validate
         # ----------------------------------------------------
 
-        if DEVICE == "cuda":
-            torch.cuda.synchronize()
+        if successful_chunks == 0:
+
+            raise RuntimeError(
+                "No audio was generated."
+            )
 
         total_ms = (
             ms() - started
         )
 
         log.info(
-            "Complete WebSocket TTS finished | "
-            "text_chars=%d | "
+            "WebSocket TTS complete | "
+            "chars=%d | "
             "chunks=%d | "
-            "%.2f ms",
+            "successful=%d | "
+            "total_ms=%.2f",
             len(text),
-            len(chunks),
+            len(text_chunks),
+            successful_chunks,
             total_ms,
         )
 
         out_q.put({
             "type": "end",
-
             "total_ms": total_ms,
-
             "text_chunks": len(
-                chunks
+                text_chunks
             ),
         })
 
@@ -1115,7 +885,7 @@ async def websocket_tts(
         while True:
 
             # ------------------------------------------------
-            # Receive request
+            # Receive JSON request
             # ------------------------------------------------
 
             raw_payload = (
@@ -1135,9 +905,7 @@ async def websocket_tts(
 
                 await ws.send_json({
                     "type": "error",
-                    "message": (
-                        "text is required"
-                    ),
+                    "message": "text is required",
                 })
 
                 continue
@@ -1150,8 +918,7 @@ async def websocket_tts(
                 await ws.send_json({
                     "type": "error",
                     "message": (
-                        "Reference voice "
-                        "is not prepared"
+                        "Reference voice is not prepared"
                     ),
                 })
 
@@ -1160,13 +927,11 @@ async def websocket_tts(
             request_started = ms()
 
             # ------------------------------------------------
-            # Calculate chunk count before generation
+            # Determine chunk count
             # ------------------------------------------------
 
-            text_chunks = (
-                split_text_for_tts(
-                    text
-                )
+            text_chunks = split_text_for_tts(
+                text
             )
 
             log.info(
@@ -1177,59 +942,36 @@ async def websocket_tts(
             )
 
             # ------------------------------------------------
-            # Start metadata
+            # Start response
             # ------------------------------------------------
 
             await ws.send_json({
                 "type": "start",
-
-                "model": (
-                    "chatterbox-flash"
-                ),
-
-                "sample_rate": (
-                    tts.sr
-                ),
-
+                "model": "chatterbox-flash",
+                "sample_rate": tts.sr,
                 "channels": 1,
-
                 "sample_width": 2,
-
-                "format": (
-                    "pcm_s16le"
-                ),
-
-                "backend": (
-                    BACKEND
-                ),
-
-                "block_size": (
-                    BLOCK_SIZE
-                ),
-
-                "text_chars": (
-                    len(text)
-                ),
-
-                "text_chunks": (
-                    len(text_chunks)
+                "format": "pcm_s16le",
+                "backend": BACKEND,
+                "block_size": BLOCK_SIZE,
+                "text_chars": len(text),
+                "text_chunks": len(
+                    text_chunks
                 ),
             })
 
             # ------------------------------------------------
-            # Worker
+            # Start generation thread
             # ------------------------------------------------
 
             out_q = queue.Queue()
 
             worker = threading.Thread(
                 target=streaming_generate,
-
                 args=(
                     text,
                     out_q,
                 ),
-
                 daemon=True,
             )
 
@@ -1238,15 +980,13 @@ async def websocket_tts(
             first_audio = True
 
             # ------------------------------------------------
-            # Stream generated chunks
+            # Forward worker output
             # ------------------------------------------------
 
             while True:
 
-                item = (
-                    await asyncio.to_thread(
-                        out_q.get
-                    )
+                item = await asyncio.to_thread(
+                    out_q.get
                 )
 
                 # --------------------------------------------
@@ -1258,9 +998,7 @@ async def websocket_tts(
                     if first_audio:
 
                         await ws.send_json({
-                            "type": (
-                                "first_audio"
-                            ),
+                            "type": "first_audio",
 
                             "ttfb_ms": (
                                 ms()
@@ -1268,36 +1006,28 @@ async def websocket_tts(
                             ),
 
                             "model_generation_ms": (
-                                item[
-                                    "generation_ms"
-                                ]
+                                item["generation_ms"]
                             ),
                         })
 
                         first_audio = False
 
-                    # Send PCM16
                     await ws.send_bytes(
                         item["pcm"]
                     )
 
-                    # Optional progress metadata
                     await ws.send_json({
                         "type": "progress",
-
                         "chunk": item.get(
                             "chunk"
                         ),
-
-                        "total_chunks": (
-                            item.get(
-                                "total_chunks"
-                            )
+                        "total_chunks": item.get(
+                            "total_chunks"
                         ),
                     })
 
                 # --------------------------------------------
-                # End
+                # Finished
                 # --------------------------------------------
 
                 elif item["type"] == "end":
@@ -1332,10 +1062,9 @@ async def websocket_tts(
 
                     await ws.send_json({
                         "type": "error",
-
-                        "message": (
-                            item["message"]
-                        ),
+                        "message": item[
+                            "message"
+                        ],
                     })
 
                     break
