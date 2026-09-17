@@ -5,10 +5,6 @@ ENV https_proxy="http://163.116.128.80:8080"
 ENV HTTP_PROXY="http://163.116.128.80:8080"
 ENV HTTPS_PROXY="http://163.116.128.80:8080"
 
-ENV no_proxy="localhost,127.0.0.1"
-ENV NO_PROXY="localhost,127.0.0.1"
-
-
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
@@ -40,7 +36,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
-
 RUN curl -LsSf https://astral.sh/uv/install.sh | sh
 
 ENV PATH="/root/.local/bin:${PATH}"
@@ -55,21 +50,26 @@ RUN git clone --depth 1 \
 
 WORKDIR /opt/chatterbox-flash
 
-
 RUN uv pip install -e ".[flashinfer]"
-
 
 RUN python - <<'PY'
 import torch
-import flashinfer
+import importlib.metadata as metadata
 
 print("=" * 70)
 print("PyTorch version      :", torch.__version__)
 print("PyTorch CUDA version :", torch.version.cuda)
-print("FlashInfer version   :", flashinfer.__version__)
+
+try:
+    print(
+        "FlashInfer version   :",
+        metadata.version("flashinfer-python")
+    )
+except metadata.PackageNotFoundError:
+    raise RuntimeError("flashinfer-python is not installed")
+
 print("=" * 70)
 PY
-
 
 RUN uv pip install \
     flashinfer-cubin \
@@ -81,7 +81,34 @@ RUN uv pip install \
     --index-url https://flashinfer.ai/whl/cu130
 
 
-RUN flashinfer show-config
+RUN python - <<'PY'
+import importlib.metadata as metadata
+
+packages = [
+    "flashinfer-python",
+    "flashinfer-cubin",
+    "flashinfer-jit-cache",
+]
+
+print("")
+print("=" * 70)
+print("FLASHINFER PACKAGES")
+print("=" * 70)
+
+for package in packages:
+    try:
+        print(f"{package:25s}: {metadata.version(package)}")
+    except metadata.PackageNotFoundError:
+        print(f"{package:25s}: NOT INSTALLED")
+        raise
+
+print("=" * 70)
+PY
+
+
+# ============================================================
+# APPLICATION
+# ============================================================
 
 WORKDIR /app
 
@@ -89,13 +116,12 @@ COPY requirements.txt .
 
 RUN uv pip install -r requirements.txt
 
-
 COPY patch_streaming.py /tmp/patch_streaming.py
 
 RUN python /tmp/patch_streaming.py
 
 
-# Fail build immediately if patch was not applied.
+# Verify patch
 RUN grep -n "block_callback" \
     /opt/chatterbox-flash/chatterbox_flash/model.py
 
@@ -104,31 +130,33 @@ COPY server.py .
 COPY client.py .
 COPY openai_client.py .
 
-
 RUN python - <<'PY'
 import torch
-import flashinfer
+import importlib.metadata as metadata
 
 print("")
 print("============================================================")
-print(" FINAL CHATTERBOX-FLASH ENVIRONMENT")
+print(" FINAL BUILD ENVIRONMENT")
 print("============================================================")
-print("Torch          :", torch.__version__)
-print("Torch CUDA     :", torch.version.cuda)
-print("FlashInfer     :", flashinfer.__version__)
-print("CUDA available :", torch.cuda.is_available())
-print("Backend        : flashinfer")
+print("Torch              :", torch.__version__)
+print("Torch CUDA         :", torch.version.cuda)
+print(
+    "FlashInfer Python  :",
+    metadata.version("flashinfer-python")
+)
+print(
+    "FlashInfer Cubin   :",
+    metadata.version("flashinfer-cubin")
+)
+print(
+    "FlashInfer JIT     :",
+    metadata.version("flashinfer-jit-cache")
+)
+print("Backend            : flashinfer")
 print("============================================================")
 PY
 
 
-# ============================================================
-# SERVER
-# ============================================================
-
 EXPOSE 8000
 
-# IMPORTANT:
-# One worker = one model instance on the A10G.
-# Do not increase workers for lowest single-request latency.
 CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
