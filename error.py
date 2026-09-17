@@ -102,3 +102,24 @@ sudo systemctl restart docker
 systemctl show docker --property=Environment
 
 docker info | grep -i proxy
+
+
+ => [ 6/18] WORKDIR /opt/chatterbox-flash                                                                                                              0.0s
+ => [ 7/18] RUN uv pip install -e ".[flashinfer]"                                                                                                     75.0s
+ => ERROR [ 8/18] RUN uv pip install     flashinfer-cubin     flashinfer-jit-cache     --index-url https://flashinfer.ai/whl/cu130                    19.3s
+------
+ > [ 8/18] RUN uv pip install     flashinfer-cubin     flashinfer-jit-cache     --index-url https://flashinfer.ai/whl/cu130:
+1.240 Using Python 3.12.3 environment at: /opt/venv
+19.32 error: No solution found when resolving dependencies
+19.32   cause: Because flashinfer-cubin was not found in the package registry and you require flashinfer-cubin, we can conclude that your requirements are unsatisfiable.
+------
+Dockerfile:45
+--------------------
+  44 |     # CUDA 13.0 FlashInfer precompiled/JIT packages.
+  45 | >>> RUN uv pip install \
+  46 | >>>     flashinfer-cubin \
+  47 | >>>     flashinfer-jit-cache \
+  48 | >>>     --index-url https://flashinfer.ai/whl/cu130
+  49 |
+--------------------
+ERROR: failed to build: failed to solve: process "/bin/sh -c uv pip install     flashinfer-cubin     flashinfer-jit-cache     --index-url https://flashinfer.ai/whl/cu130" did not complete successfully: exit code: 1
