@@ -1,9 +1,7 @@
 FROM nvidia/cuda:13.0.1-cudnn-runtime-ubuntu24.04
 
-ENV http_proxy="http://163.116.128.80:8080"
-ENV https_proxy="http://163.116.128.80:8080"
-ENV HTTP_PROXY="http://163.116.128.80:8080"
-ENV HTTPS_PROXY="http://163.116.128.80:8080"
+ARG http_proxy
+ARG https_proxy
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
@@ -36,9 +34,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ninja-build \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -LsSf https://astral.sh/uv/install.sh | sh
+RUN python3 -m venv /opt/uv \
+    && /opt/uv/bin/python -m pip install --retries 5 --timeout 60 uv \
+    && /opt/uv/bin/uv --version
 
-ENV PATH="/root/.local/bin:${PATH}"
+ENV PATH="/opt/uv/bin:${PATH}"
 
 RUN uv venv /opt/venv
 
