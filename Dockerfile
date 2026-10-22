@@ -116,6 +116,18 @@ COPY requirements.txt .
 
 RUN uv pip install -r requirements.txt
 
+RUN python - <<'PY'
+import os
+from huggingface_hub import snapshot_download
+
+model_id = os.environ["MODEL_ID"]
+snapshot_path = snapshot_download(repo_id=model_id)
+cached_path = snapshot_download(repo_id=model_id, local_files_only=True)
+if cached_path != snapshot_path:
+    raise RuntimeError("Model snapshot could not be verified in the local cache")
+print(f"Model cached for runtime: {cached_path}")
+PY
+
 COPY patch_streaming.py /tmp/patch_streaming.py
 
 RUN python /tmp/patch_streaming.py
