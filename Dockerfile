@@ -1,7 +1,9 @@
-FROM nvidia/cuda:13.0.1-cudnn-runtime-ubuntu24.04
+FROM nvidia/cuda:13.0.1-cudnn-devel-ubuntu24.04
 
 ARG http_proxy
 ARG https_proxy
+
+RUN /usr/local/cuda/bin/nvcc --version
 
 ENV DEBIAN_FRONTEND=noninteractive \
     PYTHONUNBUFFERED=1 \
